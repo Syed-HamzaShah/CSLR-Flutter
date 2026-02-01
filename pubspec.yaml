@@ -31,6 +31,10 @@ dependencies:
   flutter:
     sdk: flutter
 
+  tflite_flutter: ^0.10.4
+  google_mlkit_pose_detection: ^0.12.0
+
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
@@ -40,6 +44,7 @@ dependencies:
   google_fonts: ^8.0.0
   permission_handler: ^12.0.1
   intl: ^0.20.2
+  google_mlkit_commons: ^0.8.1
 
 dev_dependencies:
   flutter_test:
@@ -62,6 +67,10 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/sign_lang_model.tflite
+    - assets/labels.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:

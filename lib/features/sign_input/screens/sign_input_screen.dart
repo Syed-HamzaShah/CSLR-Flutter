@@ -1,7 +1,8 @@
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter/services.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
 import '../../../services/sign_language_service.dart';
 
 class SignInputScreen extends StatefulWidget {
@@ -12,9 +13,10 @@ class SignInputScreen extends StatefulWidget {
 }
 
 class _SignInputScreenState extends State<SignInputScreen> {
-  CameraController? _cameraController;
-  String _currentPrediction = "";
-  bool _isProcessing = false;
+  CameraController? _controller;
+  final SignLanguageService _service = SignLanguageService();
+  String _detectedWord = "Waiting...";
+  bool _isProcessingFrame = false;
 
   @override
   void initState() {
@@ -23,177 +25,133 @@ class _SignInputScreenState extends State<SignInputScreen> {
   }
 
   Future<void> _initializeCamera() async {
-    try {
-      final cameras = await availableCameras();
-      if (cameras.isNotEmpty) {
-        final camera = cameras.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.front,
-            orElse: () => cameras.first);
+    final cameras = await availableCameras();
+    // Use Front Camera
+    final frontCamera = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
 
-        _cameraController = CameraController(
-          camera,
-          ResolutionPreset.medium,
-          enableAudio: false,
-        );
+    _controller = CameraController(
+      frontCamera,
+      ResolutionPreset.low, // Low resolution = Faster FPS for ML
+      enableAudio: false,
+      imageFormatGroup: Platform.isAndroid 
+          ? ImageFormatGroup.nv21 
+          : ImageFormatGroup.bgra8888,
+    );
 
-        await _cameraController!.initialize();
-        if (mounted) {
-          setState(() {});
-          _startPredictionStream();
+    await _controller!.initialize();
+
+    // Start Streaming
+    _controller!.startImageStream((CameraImage image) async {
+      if (_isProcessingFrame) return;
+      _isProcessingFrame = true;
+
+      try {
+        final inputImage = _inputImageFromCameraImage(image);
+        if (inputImage != null) {
+          final result = await _service.processFrame(inputImage);
+          if (result != null) {
+            setState(() {
+              _detectedWord = result;
+            });
+          }
         }
+      } catch (e) {
+        print("Frame Error: $e");
+      } finally {
+        _isProcessingFrame = false;
       }
-    } catch (e) {
-      debugPrint("Camera error: $e");
-    }
+    });
+
+    if (mounted) setState(() {});
   }
 
-  void _startPredictionStream() {
-     if (_cameraController == null) return;
-     
-     int frameCounter = 0;
-     _cameraController!.startImageStream((CameraImage image) {
-       // Throttle to every 20 frames to simulate realistic inference timing
-       frameCounter++;
-       if (frameCounter % 20 != 0) return;
+  // Helper: Convert raw Camera bytes to ML Kit InputImage
+  InputImage? _inputImageFromCameraImage(CameraImage image) {
+    if (_controller == null) return null;
 
-       if (mounted) {
-         final service = context.read<SignLanguageService>();
-         final result = service.runInference(image);
-         setState(() {
-           _currentPrediction = result;
-         });
-       }
-     });
+    final camera = _controller!.description;
+    final sensorOrientation = camera.sensorOrientation;
+    
+    // Rotation logic
+    final InputImageRotation rotation = InputImageRotationValue.fromRawValue(sensorOrientation) 
+        ?? InputImageRotation.rotation0deg;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) 
+        ?? InputImageFormat.nv21;
+
+    // Combine planes
+    final plane = image.planes.first;
+    
+    // Note: This basic conversion works for NV21 (Android) and BGRA8888 (iOS).
+    // Complex YUV conversions may require more code if using high-res.
+    return InputImage.fromBytes(
+      bytes: Uint8List.fromList(
+        image.planes.fold<List<int>>([], (previous, plane) => previous..addAll(plane.bytes)),
+      ),
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
   }
 
   @override
   void dispose() {
-    _cameraController?.dispose();
+    _controller?.stopImageStream();
+    _controller?.dispose();
+    _service.dispose();
     super.dispose();
-  }
-
-  void _confirmAndSend() {
-    context.pop(_currentPrediction);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator()),
-      );
+    if (_controller == null || !_controller!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
-      backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text("ASL Translator (100 Words)")),
       body: Stack(
         children: [
-          // 1. Full Screen Camera
-          SizedBox.expand(
-            child: CameraPreview(_cameraController!),
-          ),
-
-          // 2. Top Overlay (Reply Context)
-          Positioned(
-            top: 50,
-            left: 20,
-            right: 20,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.reply, color: Colors.white70),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      "Replying to: Hello! How are you?", // Mock context
-                      style: TextStyle(color: Colors.white, fontSize: 14),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          // 3. Close Button
-          Positioned(
-            top: 50,
-            right: 10,
-            child: IconButton(
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: () => context.pop(),
-            ),
-          ),
-
-          // 4. Bottom Overlay (Live Caption & Send)
+          // 1. Camera Feed
+          CameraPreview(_controller!),
+          
+          // 2. Detection Overlay
           Positioned(
             bottom: 40,
             left: 20,
             right: 20,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Live Caption Box
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(24),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.9),
-                    borderRadius: BorderRadius.circular(24),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.2),
-                        blurRadius: 10,
-                        spreadRadius: 2
-                      )
-                    ]
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.8),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 10)],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "DETECTED SIGN",
+                    style: TextStyle(color: Colors.white54, fontSize: 12, letterSpacing: 1.2),
                   ),
-                  child: Column(
-                    children: [
-                      const Text(
-                        "DETECTED TEXT",
-                        style: TextStyle(
-                          color: Colors.grey,
-                          fontSize: 10,
-                          letterSpacing: 1.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _currentPrediction.isEmpty ? "..." : _currentPrediction,
-                        style: const TextStyle(
-                          color: Colors.black87,
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                    ],
+                  const SizedBox(height: 8),
+                  Text(
+                    _detectedWord,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.greenAccent,
+                      fontSize: 32,
+                      fontWeight: FontWeight.w900,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 20),
-                
-                // Send/Confirm Button
-                SizedBox(
-                  width: 70,
-                  height: 70,
-                  child: FloatingActionButton(
-                    onPressed: _currentPrediction.isNotEmpty ? _confirmAndSend : null,
-                    backgroundColor: _currentPrediction.isNotEmpty 
-                        ? const Color(0xFF00897B) // Teal
-                        : Colors.grey, 
-                    shape: const CircleBorder(),
-                    child: const Icon(Icons.check, size: 32, color: Colors.white),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],
