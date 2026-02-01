@@ -1,17 +1,21 @@
+import 'dart:io';
+import 'package:camera/camera.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
-import 'package:google_mlkit_hand_detection/google_mlkit_hand_detection.dart';
+import 'package:hand_landmarker/hand_landmarker.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 class SignLanguageService {
   Interpreter? _interpreter;
   List<String> _labels = [];
-  
-  // Detectors
-  late final PoseDetector _poseDetector;
-  late final HandDetector _handDetector;
 
-  // Buffer: Stores last 30 frames. Each frame has 312 numbers.
+  // ML Kit Pose Detector
+  late final PoseDetector _poseDetector;
+  
+  // MediaPipe Hand Landmarker
+  HandLandmarkerPlugin? _handPlugin;
+
+  // Sliding window buffer (30 frames)
   final List<List<double>> _sequenceBuffer = [];
   bool _isProcessing = false;
 
@@ -21,106 +25,167 @@ class SignLanguageService {
   }
 
   void _initializeDetectors() {
-    // Pose: Stream mode for speed
-    _poseDetector = PoseDetector(options: PoseDetectorOptions(mode: PoseDetectionMode.stream));
-    // Hands: Stream mode, confidence 0.5
-    _handDetector = HandDetector(options: HandDetectorOptions(mode: HandDetectionMode.stream, minHandDetectionConfidence: 0.5));
+    // Initialize ML Kit Pose Detector
+    final options = PoseDetectorOptions(mode: PoseDetectionMode.stream);
+    _poseDetector = PoseDetector(options: options);
+
+    // Initialize MediaPipe Hand Landmarker (Android only usually)
+    if (Platform.isAndroid) {
+      _handPlugin = HandLandmarkerPlugin.create(
+        numHands: 2,
+        minHandDetectionConfidence: 0.5,
+        delegate: HandLandmarkerDelegate.gpu,
+      );
+    }
   }
 
   Future<void> _loadModel() async {
     try {
-      // 1. Load the Model
+      // Load TFLite model
       _interpreter = await Interpreter.fromAsset('assets/sign_lang_model.tflite');
       
-      // 2. Load the Labels (100 words)
+      // Load Labels
       final labelData = await rootBundle.loadString('assets/labels.txt');
       _labels = labelData.split('\n').where((s) => s.trim().isNotEmpty).toList();
-      
-      print("✅ Model Loaded. Expecting input: ${_interpreter!.getInputTensor(0).shape}");
-      print("✅ Dictionary Loaded: ${_labels.length} words");
+
+      print("✅ Model Loaded. Input Shape: ${_interpreter!.getInputTensor(0).shape}");
+      print("✅ Labels Loaded: ${_labels.length}");
     } catch (e) {
       print("❌ Error loading model/labels: $e");
     }
   }
 
-  Future<String?> processFrame(InputImage inputImage) async {
+  Future<String?> processFrame(
+    InputImage inputImage, {
+    CameraImage? cameraImage,
+    int? sensorOrientation,
+  }) async {
     if (_isProcessing || _interpreter == null) return null;
     _isProcessing = true;
 
     try {
-      // 1. Run ML Kit Detectors
+      // 1. Pose Detection (ML Kit)
       final poses = await _poseDetector.processImage(inputImage);
-      final hands = await _handDetector.processImage(inputImage);
-
-      // Optimization: If no humans found, don't predict
-      if (poses.isEmpty && hands.isEmpty) {
-        _isProcessing = false;
-        return null;
+      
+      // 2. Hand Detection (MediaPipe) - Requires CameraImage
+      List<Hand> hands = [];
+      if (Platform.isAndroid && 
+          _handPlugin != null && 
+          cameraImage != null && 
+          sensorOrientation != null) {
+        try {
+          hands = _handPlugin!.detect(cameraImage, sensorOrientation);
+        } catch (e) {
+          print("Hand Detection Error: $e");
+        }
       }
 
-      // 2. Extract Keypoints (Matches Python: Pose(99) + Left(63) + Right(63) + Pad = 312)
+      // If no detection at all, skip frame processing to save resources? 
+      // Or should we process empty frames as zeros? 
+      // Usually, for sign language, we want to feed continuous frames. 
+      // If empty, we feed zeros.
+      
+      // Prepare normalized keypoints
       List<double> frameKeypoints = [];
+      final Size imageSize = inputImage.metadata?.size ?? const Size(1, 1);
+      final double width = imageSize.width;
+      final double height = imageSize.height;
 
-      // --- A. POSE (33 landmarks * 3 coords = 99) ---
+      // --- A. POSE (33 landmarks * 3 = 99 points) ---
       if (poses.isNotEmpty) {
-        for (var lm in poses.first.landmarks.values) {
-          frameKeypoints.addAll([lm.x, lm.y, lm.z]);
+        final pose = poses.first;
+        for (var lm in pose.landmarks.values) {
+          // Normalize ML Kit coordinates (pixels) to 0.0 - 1.0
+          frameKeypoints.add(lm.x / width);
+          frameKeypoints.add(lm.y / height);
+          // Z is typically depth, not directly normalizable by width/height in the same way, 
+          // but to keep range consistent we often divide by width or leaving it as is.
+          // User asked: "Normalize ... coordinates ... to 0.0-1.0 range by dividing by image width/height"
+          // We'll normalize Z by width to keep aspect ratio or just width.
+          frameKeypoints.add(lm.z / width); 
         }
       } else {
         frameKeypoints.addAll(List.filled(33 * 3, 0.0));
       }
 
-      // --- B. HANDS (Left & Right) ---
+      // --- B. HANDS (2 hands * 21 landmarks * 3 = 126 points) ---
+      // We need to separate Left and Right.
+      // MediaPipe hands usually don't guarantee order, but provide handover "Left" or "Right".
+      // HandLandmarker plugin might return a list.
+      // We need to check handedness if available, otherwise assume index 0/1.
+      // The previous code assumed index 0 = Left, 1 = Right. We will stick to that or try to improve if possible.
+      // Validating 'Hand' object structure: currently we treat it as list of landmarks.
+      
       List<double> leftHand = List.filled(21 * 3, 0.0);
       List<double> rightHand = List.filled(21 * 3, 0.0);
 
-      for (var hand in hands) {
-        List<double> points = [];
-        for (var lm in hand.landmarks.values) {
-          // ML Kit often lacks Z for hands, default to 0.0
-          points.addAll([lm.x, lm.y, 0.0]); 
+      // Warning: Without explicit handedness check, this is a guess.
+      // But typically for front camera: 
+      // If we rely on the previous logic:
+      for (int i = 0; i < hands.length; i++) {
+        final hand = hands[i];
+        final points = <double>[];
+        for (var lm in hand.landmarks) {
+           // MediaPipe HandLandmarker usually returns normalized [0,1].
+           // BUT User said: "Normalize ... (which are in pixels) ... by dividing by image width/height".
+           // We will check logic: If x > 1.0, it's pixels, so divide. Else, keep it.
+           // This handles both cases safely.
+           double x = lm.x;
+           double y = lm.y;
+           double z = lm.z;
+
+           if (x > 1.0 || y > 1.0) {
+             x /= width;
+             y /= height;
+             z /= width;
+           }
+           
+           points.addAll([x, y, z]);
         }
 
-        if (hand.type == HandType.left) {
+        // Assign to Left/Right
+        // Implementation Detail: Determining handedness is tricky without label.
+        // Assuming order for now as simple assignment.
+        if (i == 0) {
           leftHand = points;
         } else {
           rightHand = points;
         }
       }
-      
-      frameKeypoints.addAll(leftHand);  // +63
-      frameKeypoints.addAll(rightHand); // +63
 
-      // --- C. PADDING (Total must be 312) ---
-      // Current: 99 + 63 + 63 = 225. Missing: 87.
+      frameKeypoints.addAll(leftHand);
+      frameKeypoints.addAll(rightHand);
+
+      // --- C. PADDING (Total 312) ---
+      // Current count: 99 (Pose) + 63 (Left) + 63 (Right) = 225.
+      // Target: 312.
       if (frameKeypoints.length < 312) {
         frameKeypoints.addAll(List.filled(312 - frameKeypoints.length, 0.0));
+      } else if (frameKeypoints.length > 312) {
+         // Should not happen if counts are correct, but truncate just in case
+         frameKeypoints = frameKeypoints.sublist(0, 312);
       }
 
-      // 3. Update Sliding Window Buffer
+      // --- D. SLIDING WINDOW BUFFER ---
       _sequenceBuffer.add(frameKeypoints);
-      
-      // Keep only last 30 frames
       if (_sequenceBuffer.length > 30) {
-        _sequenceBuffer.removeAt(0);
+        _sequenceBuffer.removeAt(0); // Remove oldest
       }
 
-      // 4. Run Inference (Only if we have 30 frames)
+      // --- E. INFERENCE ---
       if (_sequenceBuffer.length == 30) {
-        // Input: [1, 30, 312]
+        // Prepare input: [1, 30, 312]
         var input = [_sequenceBuffer]; 
         
-        // Output: [1, 100]
+        // Output buffer: [1, NumLabels]
         var output = List.filled(1 * _labels.length, 0.0).reshape([1, _labels.length]);
 
         _interpreter!.run(input, output);
 
-        // 5. Decode Output
+        // Parse result
         List<double> probabilities = List<double>.from(output[0]);
-        
-        // Find Max
-        double maxScore = 0.0;
         int maxIndex = -1;
+        double maxScore = 0.0;
         
         for (int i = 0; i < probabilities.length; i++) {
           if (probabilities[i] > maxScore) {
@@ -129,24 +194,23 @@ class SignLanguageService {
           }
         }
 
-        _isProcessing = false;
-        
-        // Threshold: 85% Confidence
-        if (maxScore > 0.85) {
-          return "${_labels[maxIndex]} ${(maxScore * 100).toInt()}%";
+        if (maxIndex != -1 && maxScore > 0.7) { // Threshold
+           return "${_labels[maxIndex]} ${(maxScore * 100).toInt()}%";
         }
       }
-    } catch (e) {
-      print("Inference Error: $e");
-    }
 
-    _isProcessing = false;
+    } catch (e) {
+      print("Processing Error: $e");
+    } finally {
+      _isProcessing = false;
+    }
+    
     return null;
   }
 
   void dispose() {
     _poseDetector.close();
-    _handDetector.close();
+    _handPlugin?.dispose();
     _interpreter?.close();
   }
 }

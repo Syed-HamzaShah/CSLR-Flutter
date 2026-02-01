@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data'; // Needed for Uint8List
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -34,70 +35,84 @@ class _SignInputScreenState extends State<SignInputScreen> {
 
     _controller = CameraController(
       frontCamera,
-      ResolutionPreset.low, // Low resolution = Faster FPS for ML
+      ResolutionPreset.low, // Lower resolution for faster processing
       enableAudio: false,
-      imageFormatGroup: Platform.isAndroid 
-          ? ImageFormatGroup.nv21 
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
           : ImageFormatGroup.bgra8888,
     );
 
-    await _controller!.initialize();
+    try {
+      await _controller!.initialize();
+      if (!mounted) return;
 
-    // Start Streaming
-    _controller!.startImageStream((CameraImage image) async {
-      if (_isProcessingFrame) return;
-      _isProcessingFrame = true;
+      // Start Stream
+      _controller!.startImageStream((CameraImage image) async {
+        if (_isProcessingFrame) return;
+        _isProcessingFrame = true;
 
-      try {
-        final inputImage = _inputImageFromCameraImage(image);
-        if (inputImage != null) {
-          final result = await _service.processFrame(inputImage);
-          if (result != null) {
-            setState(() {
-              _detectedWord = result;
-            });
+        try {
+          final inputImage = _inputImageFromCameraImage(image);
+          if (inputImage != null) {
+            final result = await _service.processFrame(
+              inputImage,
+              cameraImage: image,
+              sensorOrientation: _controller!.description.sensorOrientation,
+            );
+
+            if (result != null) {
+              setState(() {
+                _detectedWord = result;
+              });
+            }
           }
+        } catch (e) {
+          debugPrint("Error processing frame: $e");
+        } finally {
+          _isProcessingFrame = false;
         }
-      } catch (e) {
-        print("Frame Error: $e");
-      } finally {
-        _isProcessingFrame = false;
-      }
-    });
+      });
 
-    if (mounted) setState(() {});
+      setState(() {});
+    } catch (e) {
+      debugPrint("Camera initialization error: $e");
+    }
   }
 
-  // Helper: Convert raw Camera bytes to ML Kit InputImage
   InputImage? _inputImageFromCameraImage(CameraImage image) {
     if (_controller == null) return null;
 
     final camera = _controller!.description;
     final sensorOrientation = camera.sensorOrientation;
-    
-    // Rotation logic
-    final InputImageRotation rotation = InputImageRotationValue.fromRawValue(sensorOrientation) 
-        ?? InputImageRotation.rotation0deg;
 
-    final format = InputImageFormatValue.fromRawValue(image.format.raw) 
-        ?? InputImageFormat.nv21;
+    // Rotation
+    final InputImageRotation rotation =
+        InputImageRotationValue.fromRawValue(sensorOrientation) ??
+        InputImageRotation.rotation0deg;
 
-    // Combine planes
-    final plane = image.planes.first;
-    
-    // Note: This basic conversion works for NV21 (Android) and BGRA8888 (iOS).
-    // Complex YUV conversions may require more code if using high-res.
-    return InputImage.fromBytes(
-      bytes: Uint8List.fromList(
-        image.planes.fold<List<int>>([], (previous, plane) => previous..addAll(plane.bytes)),
-      ),
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: plane.bytesPerRow,
-      ),
+    // Format
+    final InputImageFormat format =
+        InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+
+    // Bytes
+    // For NV21 (Android), plane[0] is Y, plane[1] is VU interlaced (or similar).
+    // InputImage.fromBytes handles this if we pass all bytes.
+    final allBytes = WriteBuffer();
+    for (final plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    // Metadata
+    final metadata = InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: format,
+      bytesPerRow: image.planes[0].bytesPerRow, 
     );
+
+    return InputImage.fromBytes(bytes: bytes, metadata: metadata);
   }
 
   @override
@@ -111,44 +126,53 @@ class _SignInputScreenState extends State<SignInputScreen> {
   @override
   Widget build(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator()),
+      );
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text("ASL Translator (100 Words)")),
+      appBar: AppBar(title: const Text("ASL Translator")),
+      backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // 1. Camera Feed
+          // Camera Preview
           CameraPreview(_controller!),
-          
-          // 2. Detection Overlay
+
+          // Overlay
           Positioned(
-            bottom: 40,
+            bottom: 50,
             left: 20,
             right: 20,
             child: Container(
-              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+              padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.8),
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 10)],
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white24),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   const Text(
                     "DETECTED SIGN",
-                    style: TextStyle(color: Colors.white54, fontSize: 12, letterSpacing: 1.2),
+                    style: TextStyle(
+                      color: Colors.grey,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.0,
+                    ),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 10),
                   Text(
                     _detectedWord,
-                    textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: Colors.greenAccent,
                       fontSize: 32,
-                      fontWeight: FontWeight.w900,
+                      fontWeight: FontWeight.bold,
                     ),
+                    textAlign: TextAlign.center,
                   ),
                 ],
               ),

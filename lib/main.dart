@@ -31,7 +31,7 @@ class SignChatApp extends StatelessWidget {
     return MultiProvider(
       providers: [
         Provider<SignLanguageService>(
-          create: (_) => SignLanguageService()..loadModel(),
+          create: (_) => SignLanguageService(),
         ),
       ],
       child: MaterialApp.router(

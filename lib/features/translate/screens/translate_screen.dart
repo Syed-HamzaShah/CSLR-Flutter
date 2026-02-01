@@ -1,5 +1,8 @@
+import 'dart:typed_data';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
 import 'package:provider/provider.dart';
 import '../../../services/sign_language_service.dart';
 
@@ -30,8 +33,9 @@ class _TranslateScreenState extends State<TranslateScreen> {
       if (cameras.isNotEmpty) {
         // Use the front camera if available, otherwise the first one
         final camera = cameras.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.front,
-            orElse: () => cameras.first);
+          (c) => c.lensDirection == CameraLensDirection.front,
+          orElse: () => cameras.first,
+        );
 
         _cameraController = CameraController(
           camera,
@@ -54,22 +58,50 @@ class _TranslateScreenState extends State<TranslateScreen> {
   }
 
   void _startInferenceStream() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    if (_cameraController == null || !_cameraController!.value.isInitialized)
+      return;
 
     int frameCount = 0;
-    _cameraController!.startImageStream((CameraImage image) {
+    _cameraController!.startImageStream((CameraImage image) async {
       frameCount++;
-      // Run inference every 30 frames to simulate real-time performance without UI blocking
-      if (frameCount % 30 == 0) {
-        final service = context.read<SignLanguageService>();
-        final result = service.runInference(image);
-        if (mounted) {
-          setState(() {
-            _translationText = result;
-          });
-        }
+      if (frameCount % 30 != 0) return;
+      final inputImage = _inputImageFromCameraImage(image);
+      if (inputImage == null || !mounted) return;
+      final service = context.read<SignLanguageService>();
+      final result = await service.processFrame(
+        inputImage,
+        cameraImage: image,
+        sensorOrientation: _cameraController!.description.sensorOrientation,
+      );
+      if (mounted && result != null) {
+        setState(() {
+          _translationText = result;
+        });
       }
     });
+  }
+
+  InputImage? _inputImageFromCameraImage(CameraImage image) {
+    if (_cameraController == null) return null;
+    final sensorOrientation = _cameraController!.description.sensorOrientation;
+    final rotation =
+        InputImageRotationValue.fromRawValue(sensorOrientation) ??
+        InputImageRotation.rotation0deg;
+    final format =
+        InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+    final plane = image.planes.first;
+    return InputImage.fromBytes(
+      bytes: Uint8List.fromList(
+        image.planes.fold<List<int>>([], (prev, p) => prev..addAll(p.bytes)),
+      ),
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
   }
 
   @override
@@ -88,7 +120,7 @@ class _TranslateScreenState extends State<TranslateScreen> {
           Expanded(
             child: _selectedIndex == 0 ? _buildSignMode() : _buildVoiceMode(),
           ),
-          
+
           // Bottom Controls
           Container(
             color: const Color(0xFF212121),
@@ -123,22 +155,22 @@ class _TranslateScreenState extends State<TranslateScreen> {
                     });
                   },
                   style: ButtonStyle(
-                    backgroundColor: MaterialStateProperty.resolveWith<Color>(
-                      (Set<MaterialState> states) {
-                        if (states.contains(MaterialState.selected)) {
-                          return const Color(0xFF00897B);
-                        }
-                        return Colors.grey[800]!;
-                      },
-                    ),
-                    foregroundColor: MaterialStateProperty.resolveWith<Color>(
-                      (Set<MaterialState> states) {
-                        if (states.contains(MaterialState.selected)) {
-                          return Colors.white;
-                        }
-                        return Colors.grey;
-                      },
-                    ),
+                    backgroundColor: MaterialStateProperty.resolveWith<Color>((
+                      Set<MaterialState> states,
+                    ) {
+                      if (states.contains(MaterialState.selected)) {
+                        return const Color(0xFF00897B);
+                      }
+                      return Colors.grey[800]!;
+                    }),
+                    foregroundColor: MaterialStateProperty.resolveWith<Color>((
+                      Set<MaterialState> states,
+                    ) {
+                      if (states.contains(MaterialState.selected)) {
+                        return Colors.white;
+                      }
+                      return Colors.grey;
+                    }),
                   ),
                 ),
               ],
@@ -157,7 +189,10 @@ class _TranslateScreenState extends State<TranslateScreen> {
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 16),
-            Text("Initializing Camera...", style: TextStyle(color: Colors.white)),
+            Text(
+              "Initializing Camera...",
+              style: TextStyle(color: Colors.white),
+            ),
           ],
         ),
       );
@@ -166,10 +201,8 @@ class _TranslateScreenState extends State<TranslateScreen> {
     return Stack(
       children: [
         // Camera Preview
-        SizedBox.expand(
-          child: CameraPreview(_cameraController!),
-        ),
-        
+        SizedBox.expand(child: CameraPreview(_cameraController!)),
+
         // Output Overlay
         Positioned(
           bottom: 20,
@@ -178,7 +211,9 @@ class _TranslateScreenState extends State<TranslateScreen> {
           child: Card(
             color: Colors.white.withOpacity(0.9),
             elevation: 4,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
             child: Padding(
               padding: const EdgeInsets.all(16.0),
               child: Column(
@@ -198,15 +233,20 @@ class _TranslateScreenState extends State<TranslateScreen> {
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       IconButton(
-                        icon: const Icon(Icons.volume_up, color: Color(0xFF00897B)),
+                        icon: const Icon(
+                          Icons.volume_up,
+                          color: Color(0xFF00897B),
+                        ),
                         onPressed: () {
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Reading text aloud...')),
+                            const SnackBar(
+                              content: Text('Reading text aloud...'),
+                            ),
                           );
                         },
                       ),
                     ],
-                  )
+                  ),
                 ],
               ),
             ),
@@ -225,9 +265,9 @@ class _TranslateScreenState extends State<TranslateScreen> {
             onTap: () {
               setState(() {
                 _isListening = !_isListening;
-                _translationText = _isListening 
-                  ? "Listening..." 
-                  : "Speech-to-Text Result mockup.";
+                _translationText = _isListening
+                    ? "Listening..."
+                    : "Speech-to-Text Result mockup.";
               });
             },
             child: AnimatedContainer(
@@ -236,14 +276,19 @@ class _TranslateScreenState extends State<TranslateScreen> {
               width: 120,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: _isListening ? Colors.redAccent : const Color(0xFF00897B),
+                color: _isListening
+                    ? Colors.redAccent
+                    : const Color(0xFF00897B),
                 boxShadow: [
                   BoxShadow(
-                    color: (_isListening ? Colors.redAccent : const Color(0xFF00897B))
-                        .withOpacity(0.5),
+                    color:
+                        (_isListening
+                                ? Colors.redAccent
+                                : const Color(0xFF00897B))
+                            .withOpacity(0.5),
                     blurRadius: 30,
                     spreadRadius: 10,
-                  )
+                  ),
                 ],
               ),
               child: Icon(
@@ -259,13 +304,10 @@ class _TranslateScreenState extends State<TranslateScreen> {
             child: Text(
               _isListening ? "Listening..." : "Tap mic to speak",
               textAlign: TextAlign.center,
-              style: TextStyle(
-                color: Colors.grey[400],
-                fontSize: 18,
-              ),
+              style: TextStyle(color: Colors.grey[400], fontSize: 18),
             ),
           ),
-           if (!_isListening && _translationText != "Waiting for input...")
+          if (!_isListening && _translationText != "Waiting for input...")
             Padding(
               padding: const EdgeInsets.only(top: 24.0),
               child: Text(
